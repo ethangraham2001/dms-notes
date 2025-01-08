@@ -512,6 +512,8 @@ easy to determine selectivity of a composite predicate. However, if they are
 correlated, it is a whole shitstorm. Sometimes we just try to guess 
 correlation. Histograms are useful - just make sure it is the right one.
 
+![](images/histogram-creation.png)
+
 This should be good motivation for why systems invest in maintaining high
 quality statistics.
 
