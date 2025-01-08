@@ -268,7 +268,7 @@ The protocol of 2PL looks like
 
 - Before accessing an object, acquire a lock.
 - A transaction acquires a lock only once. Lock upgrades are possible.
-- A transaction is locked if the request cannot be granted according to the
+- A transaction is blocked if the request cannot be granted according to the
     compatibility matrix.
 - A transaction goes through two phases
     - Growth: acquire locks, but never release one
@@ -276,7 +276,7 @@ The protocol of 2PL looks like
 - At `EOT` (whether that be commit or abort) all locks must be released.
 
 2PL prevents histories where a transaction must be aborted due to concurrency
-control issues - we canot proceed with an operation until we know it is safe.
+control issues - we cannot proceed with an operation until we know it is safe.
 Without, this can happen: `L1[x] w1[x] U1[x] L2[x] w2[x] L2[y] w2[y] U2[y]`,
 which would mean that `T_1` could access `y` for read or write and in doing so
 create a non-serializable history. This can't happen if 2PL is enforced.
@@ -357,12 +357,12 @@ predicate. Lock conversion can lead to deadlocks, as we may be waiting on a
 write lock on something held by something waiting for a write lock on what we
 hold a read lock for.
 
-**Intent locks** are made to prevet other transactions from modifying the 
+**Intent locks** are made to prevent other transactions from modifying the 
 higher-level resource in a way that would invalidate the lock at the lower
 level. We can prevent conflict detection at a high-level while still providing
 low-level locks. For example acquire `IS` lock on a whole table and then do
-so hierarchical downward until we find what we want to read in particular, and
-acquire a `S` lock on it. No one can write to anything while we are holding 
+so hierarchically downward until we find what we want to read in particular, 
+and acquire a `S` lock on it. No one can write to anything while we are holding 
 this. We no longer need to examine every row to detect conflicts, we can do so
 much more coarsely. 
 
@@ -404,3 +404,306 @@ all written tuples is the one written. If not, then somebody committed a newer
 version and we must abort.
 
 We still use table locks to prevent too many conflicts.
+
+## Logging
+
+> Someone refuses to write down all of their appointments because they want to
+> save paper. But when they start forgetting, they wonder if they couldn't have
+> saved themselves all the hassle by just writing it down.
+
+That's basically logging in a nutshell. Add little overhead in order to be
+incredibly resilient to all types of failures.
+
+### Recovery In a Nutshell
+
+We want to be able to rebuild consistent DB state after a failure, whether this
+be related to a transaction failure _(aborts, rollbacks, client failures)_, 
+system failures _(power off, OS failure)_ or media failure _(disk failure)_.
+
+Some of these are easy - we can undo transactions so long as they create undo
+records. System failures use **redo/undo logs**, which is what we cover in this
+chapter. Media failures typically require replication and the like, nothing 
+that we want to separate log files from data files.
+
+### The Log
+
+- **before image:** value that existed in DB before transaction modifies it.
+- **after image:** value that exists in DB after a transaction modified it.
+- **log record:** where we store before image, after image, transaction id,
+    SCN, LSN, etc...
+
+We persist both the log and the data, and recover procedures typically involve
+combining both of them (depending on design). We may also persist other data
+structures, such as which transactions have committed/aborted.
+
+Log records are ordered and reflect the logical sequence of events in the DB.
+We use **LSN (log sequence number)** and **SCN (system change number)** 
+depending on our needs.
+
+### Durability
+
+This requires that the DBMS remembers what has been committed, and that it can
+recover the last committed state of the database, i.e return to a consistent
+state. Durability **strictly requires** persistence - I/O is is expensive, but
+we need this in order to remember what is committed. Thus when a transaction
+commits, we _need_ to persist something that helps us achieve this.
+
+So when should we write to persistent storage? 
+
+- If changes from an active transaction end up on persistent storage, then
+    recovery will require an undo
+- If the changes of a committed transaction aren't yet on persistent storage,
+    when the transaction is declared as committed _(client notified)_ recovery
+    will involve redoing those changes.
+
+We speak here about _undo changes_ and _redo changes_ held in some **undo log**
+and **redo log** respectively.
+
+In both cases we _need_ the log. When a transaction commits, all its log 
+entries need to be persisted.
+
+### Recovery
+
+We first discuss the **recovery manager** which implements the recovery 
+procedure. This depends on how the system functions, namely on when 
+modifications are written to disk w.r.t when the transaction commits.
+
+The recovery manager is intertwined with the operations of the buffer cache.
+
+- **steal policy:** an uncommitted transaction is allowed to overwrite the
+    persisted changes of a committed transaction. This happens when the buffer
+    cache has to flush dirty pages to storage _before_ a transaction commits.
+    Such occurrences require us to be able to undo this transaction if it
+    aborts.
+- **force policy:** all changes made by a transaction must be persisted before
+    it commits. Requires us to be able to flush all updated blocks from the
+    transaction. If this isn't in place, we need to be able to redo the
+    transaction if the system fails before we flush.
+- **Steal/no-force:** both undo and redo, the most common approach.
+
+Locking tuples and updating the blocks they lie in may be problematic. 
+Transactions that aren't in conflict may still be updating the same block.
+If this is written to storage, then it is possible that some changes are 
+committed while others not. If failures occur, we can't guarantee that storage
+is persistent!
+
+#### UNDO and REDO
+
+- READ: read the value from the block in the buffer cache
+- WRITE: create log entry _(before image and after image)_ and append to
+    persisted log. Write the after image block to the buffer cache
+- COMMIT: write a persisted log entry indicating the transaction has committed
+- ABORT: for all updates, restore the before image using the log entry.
+
+The recovery procedure is as follows
+
+- Start from the end of the log and work backwards
+- Keep a list of undone items and another for redone items
+- Procedure terminates when all items are either in the undone or redone list,
+    or when we reach the beginning of the log.
+- For each log entry, look at the data item `x` being accessed. If `x` is in
+    none of the two lists
+    - If the log entry is of a committed transaction, apply the after image.
+        add `x` to the redone list.
+    - If the log entry if of an aborted transaction, apply the before image, 
+        add `x` to the undone list
+
+The actual data on disk is ignored as it could correspond to data from an
+undone transaction. It is just used as a starting point for replaying the log.
+
+Intuitively, we do the following for every item in the DB
+
+- Find the last committed transaction that modified it, and REDO the 
+    modification
+- If no committed transaction modified it, find the first aborted transaction
+    that modified it, and UNDO the modification.
+- If no transaction has touched the item, its value is consistent, as we assume
+    that we started at some consistent state.
+
+In practice we can do this cheaper than replaying the whole log back-to-front.
+
+The advantages of UNDO/REDO recovery is that we only require log records be
+persisted, and we give the buffer cache lots of freedom. No need to flush
+dirty pages if the space isn't needed, I/O on data minimized and only triggered
+by block evictions, and allows us to write dirty data from uncommitted 
+transactions to disk. It does complicate recovery and it is costly, but normal
+DBMS functionality is minimally affected which is nice. Queries aren't affected
+since there is no forced I/O of data! Transactions will be, though, as we
+need to write updates to log.
+
+#### UNDO, no REDO
+
+- READ: read the value from the block in buffer cache
+- WRITE: create a log entry _(before image only)_ and append it to the 
+    persisted log. Write the after image to the block on the buffer cache
+- COMMIT: flush all dirty values modified by the transaction if it still in the
+    cache _(may already be persisted)_ and write a persistent log entry 
+    indicating that the transaction has committed.
+- ABORT: for all updates, restore the before image using the log entry
+
+The recovery procedure is as follows, starting from the end of the log and
+scanning backwards
+
+- Keep list of UNDONE items
+- Procedure terminates when all items are in UNDONE list or when we reach
+    the beginning of the log
+- For each log entry, look at the data `x` being accessed. If it is not in the
+    UNDONE list and transaction as aborted, we UNDO the changes using the
+    persisted before image, and add `x` to the UNDONE list.
+
+The intuition here is that for every item in DB if no aborted transaction 
+touched it, then it is correct. Otherwise, we find the _last_ aborted one and 
+restore the before image. This works because of the strict execution 
+assumptions we make, i.e. that there can only be one aborted transaction that
+modified the correct value at the time of failure - it is enough to just undo 
+that aborted transaction and we will have the last committed value.
+
+We have some trade-offs between this model and the UNDO and REDO model from
+the previous section
+
+- We force I/O on all dirty blocks touched by a transaction. This could be
+    lots of pages, and as DBMS pages grow bigger this can be costly.
+- Log records no longer need the after images! Makes the log records smaller!
+- Shorter recovery procedure as we only have to redo aborted transactions, and
+    theoretically don't even need log entries of committed transactions.
+
+The tradeoff here doesn't actually pay off in practice, as we still need to
+write to the log with every update, and here we force **a lot** of I/O. 
+Flushing the buffer cache interferes with its usual operation, i.e. slower
+queries.
+
+#### No UNDO, REDO
+
+- READ: if the transaction did not write the item before, read the value from
+    the block in the buffer cache. Otherwise, we read from a temporary buffer.
+- WRITE: create the log entry _(after image)_ and append it to the persisted
+    log. Write the after image to some temporary buffer _(e.g. shadow pages)_.
+- COMMIT: apply all updates in the temporary buffer to the actual data blocks.
+    Write to persistent log that the transaction has committed.
+- ABORT: discard the temporary buffer.
+
+Recover procedure looks like, starting from the end of the log and scanning
+backwards
+
+- Keep a list of REDONE items, terminating procedure when all items are in
+    REDONE list or when we reach beginning of log
+- For each log entry, look at data item accessed `x`. If it is in the REDONE
+    list continue, otherwise add it, and redo the changes by using the before
+    image and.
+
+We rely on the fact that there are never dirty blocks in the buffer cache. All
+data there is committed and it the last commited version. Intuitively, for
+every DB item, find the last committed transaction that touched it, and REDO
+it. This is needed because we aren't flushing at every commit, and it could
+be that the changes made by a committed transaction aren't committed yet and
+we need to redo them on recovery.
+
+More trade-offs involved here
+
+- Forced I/O only on log records
+- Log records only need after image, making this smaller than UNDO and REDO.
+- Recover procedure is shorter as it only involes REDOing the last committed
+    transaction that touched an item. We theoretically don't need log entris
+    for aborted transactions.
+
+This is somewhat similar to snapshot isolation, as we read from the snapshot
+at the time of start, write to a buffer which is only applied to buffer cache
+on commit, and reads / writes do not interfere with each other.
+
+#### No UNDO, No REDO
+
+We require an auxiliary data structure for this called a directory. This
+directory, at a high level, is just showing where the DBMS is pointing to at a 
+given point in time.
+
+- READ: if the value has not been written before by the transaction, use the
+    current directory to find the latest committed copy. If the value has been
+    written before by the transaction, use the shadow directory of that
+    transaction to find the updated copy.
+- WRITE: write to a buffer and add a pointer in the shadow directory for the
+    transaction
+- COMMIT: create a full directory by merging the current one and the shadow
+    directory of the transaction
+- ABORT: Discard the buffer and the shadow directory
+
+Not really used in conventional DB. No log required
+
+- No undo implies that we need no before images as no uncommitted data is 
+    persisted.
+- No redo implies that no after images are needed because when transactions
+    commit, all changes are persisted.
+
+It requires us to be able to persist all changes made by a transaction in a 
+single atomic action.
+
+The whole point of this model is that we need no recovery procedure!
+
+This isn't really used in practice even though some of the ideas are partially
+applied. Access to storage now requires an indirection through the directory
+that indicates the latest version - this is pretty expensive. We also need to
+garbage collect uncommitted values, as well as shadow directories etc...
+Data moves a lot, which can create problems with block representation, as well
+as clustered indexes.
+
+### Implementation of Recovery
+
+Enough with the theory. How does this actually work? Firstly, we comment on
+what is inside a log entry.
+
+- **LSN:** log sequence number used to navigate the log. We can order 
+    transactions using this, and decide what goes before / after.
+- **SCN:** system change number used to timestamp events. Is used in snapshot
+    isolation to identify correct snapshots.
+- Pointers to other log records of the same transaction
+- Transaction ID and related information
+- REDO related information: change vectors describing changes to a single block
+    of data _(after images)_
+- UNDO related information such as before images
+
+Oracle uses a redo log as a circular buffer in memory. As transactions modify
+data, redo records are created in memory and placed in the redo log buffer.
+When a commit occurs, the redo records are flushed to a file in storage. We use
+several files
+
+- The log writer only writes to a single redo log file at a time
+- When a file is full and needs to be archived, the LSN is increased and the
+    system switches to a new redo log file
+
+We don't want archival to interfere with normal operations, so we always have
+an available log file to write to.
+
+### Group Commit and Log Buffer Flush
+
+Log buffer has to be flushed to disk when various events occur
+
+- Transaction commit
+- Full buffer
+- Dirty pages written to storage
+- Checkpoint is taken.
+
+If we can batch this, then we want to batch it. This incurs a slight delay in
+committing, but there is less I/O overhead since all log entries are written
+in one go. This can happen anyway when committing from a circular log buffer.
+
+### Write Ahead Logging 
+
+WAL is the most common implementation of these ideas. We separate persistent
+storage for data from persistent storage for the log. Log contains enough
+information to implement whatever policy we have chosen, and the records
+correspond to a change in the database that _must_ be written to the log before
+changes to the data in the buffer cache are flushed to persistent storage.
+A commit record in the log is used to mark the end of a transaction.
+
+WAL is just a means to an end, our end being our recovery policies as we
+described. It makes sense - just write to the log before anything is persisted.
+
+We typically use this to implement UNDO/REDO _(on 2PL-based systems)_ or 
+no UNDO / REDO _(on SI-based systems)_.
+
+We note that a log would grow unbounded if we didn't use checkpoints, leading 
+to storage issues and long recovery times. A checkpoint is when we push all 
+dirty blocks to disk, push all the logs in the log buffer to disk, and
+archive the transaction table / dirty pages table. We mark the log with a
+checkpoint label and flush it to the log. Recovery happens from a checkpoint,
+not from the beginning of the DB. **A checkpoint doesn't have to be a 
+consistent copy of the DB**.
