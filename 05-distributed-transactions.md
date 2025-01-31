@@ -169,9 +169,166 @@ Persistence in 3PC happens very similarly to 2PC, in that it uses a WAL.
     all and wait for ACKs to send a commit message.
 
 
-```
-TODO: FINISH THIS SECTION. NO ENERGY TO DO IT NOW, BUT RIGHT AT THE END OF 
-SLIDES
-```
+## Replication
 
+In this chapter, we dive into replication - a form of redundancy that is key
+in a distributed setting. We will cover this at a lower-level than the Big Data
+course, namely covering how updates happen when data is replicated. We are
+interested in
 
+- Performance. Local accesses are fast, over-the-network accesses are slow.
+- Fault tolerance. Single site failures should not affect overall availability.
+- Application type. We mainly look at OLTP and OLAP which are write and read
+    intensive respectively.
+
+We need to decide not only _when_ updates are propagates, but also _where_.
+We start with the first of the two.
+
+### When?
+
+#### Synchronous Replication
+
+Data is propagated immediately, and all changes are immediately applied to all
+existing copies. Propagated within the scope of the transaction making the
+updates.
+
+This is refered to as _eager_ replication.
+
+#### Asynchronous Replication
+
+First execute the updates on the local copy, then propagate to all other 
+copies. During propagation, the non-local copies will be inconsistent for a 
+period of time which is application adjustable.
+
+This is refered to as _lazy_ replication.
+
+### Where?
+
+#### Update Everywhere
+
+Changes can be initiated at any of the copies - i.e. any site owning a copy.
+We call this _multimaster_. This can either be implemented synchronously, or 
+asynchronously.
+
+Any transaction can run a transaction, which is leads to fairer overall
+resource utilization, but we do need to synchronize copies.
+
+#### Primary Copy
+
+Only one copy can be updated _(the master)_. All other copies, called 
+_(secondary)_ are updated reflecting the changes to the master.
+
+This places more load on the system that holds the primary copy, and means that
+reading a local copy may return out-of-date data.
+
+### A Brief History of Replication
+
+The earliest form of replication was primary-copy asynchronous - it was done
+over tables or over materialized views _(over one table)_.
+
+A step forward is to allow local-copy updates, then propagating to the primary
+copy. Once more, this is only allowed ovre materialized views or single tables.
+
+In practice, synchronous replication is too expensive for both primary-copy
+and update-everywhere replication. Asynchronous replication is feasible in
+both cases, is subject to inconsistent reads.
+
+We notice a trade-off between correctness and performance.
+
+### Implementing Replication
+
+Recall, the user interacts with the DB by issuing read and write operations.
+We group these into transactions that respect the ACID properties. We are
+particularly interested in A and I here.
+
+- **Isolation** is guaranteed by a concurrency control protocol, which is
+    normally 2PL in commercial DBs.
+- **Atomicity** is guaranteed by requiring that a transaction commit all of its
+    changes. When a transaction executes at various sites, it must execute
+    an _atomic commitment protocol_ - it must commit at all sites or at none
+    of them. Commercial systems use 2PC for this.
+
+On a local system, the **transaction manager** takes care of isolation and
+atomicity. It will acquire locks on behalf of all transactions and then try
+to come up with a serializable execution. If the transactions follow 2PL,
+then serializability is guaranteed - the scheduler just needs to enforce 2PL.
+
+Replication makes guaranteeing atomicity and isolation more complicated.
+Atomicity is guaranteed by 2PC, but synchronizing serialization orders across
+sites is difficult, as we need to make sure that all sites do thing in the same
+order to avoid inconsistent copies. This is why we need **replication 
+protocols**.
+
+- Specifies how the different sites must be coordinates in order to provide a
+    concrete set of guarantees.
+- Depends on the replication strategy _(sync, async, primary-copy, 
+    update-everywhere).
+
+This has an associated cost, and doesn't scale well with the number of nodes
+in the system. We want our reads to be local in order to reap performance
+advantages.
+
+#### Synchronous Update Everywhere
+
+Assuming all sites contain the smae data, we can apply a **read one write all**
+approach. Each site uses 2PL - our read operations are performed locally, and
+our writes are performed at all sites using a distributed locking protocol.
+This protocol guarantees that every site behaves as if there were one DB.
+Site failures mean that we cannot write anywhere, so we must wait for their
+recovery.
+
+We could, when a site fails, use an approach of **writing all available 
+copies**. A read means we can read any copy, and a write means that we send
+`write(x)` to every copy - if a site rejects, abort. All sites not responding
+are called "missing writes". To commit a protocol, check that all sites labeled
+with "missing write" are still down, if not abort. Check that all sites that
+were available still are, and if some don't respond, abort.
+
+In practice, however, site failures aren't the only source of failure. We may
+also have communication failures leading to network partitions. We can assume
+that a communication failure means the site failed, and make that work with
+existing protocols - this is a bit naive.
+
+#### Quorum Protocols
+
+Quorums are sets of sites formed such as to be able to determine that it will
+have a non-empty intersection with other quorums.
+
+- Simple majorities _(site quorums)_
+- Weighted majorities _(quorum consensus)_
+- Logical structures _(tree, matrix, projective planes quorums)_
+
+Our desirable properties are
+
+- **Equal effort:** all quorums should have the same size.
+- **Equal responsibility:** all sites should participate on the same number
+    of quorums
+- **Dynamic reconfiguration:** establishing a quorum should be dynamic to
+    account for failures and configuration changes
+- **Low communication overhead:** minimize the number of messages exchanged.
+- **Graceful degradation:** effort proportionate to failures
+
+#### Weighted Quorums
+
+We describe the consensus protocol for weighted quorums.
+
+- Each copy has an assigned weight
+- The total weight of all copies is $N$
+- Let $RTT and $WT$ be read and write thresholds, respectively, such that
+    - $2 \cdot WT > N$
+    - $RT + WT > N$
+- A read quorum is a set of copies such that their total weight is greater than
+    or equal to $RT$
+- A write quorum is a set of copies such that their total weight is greater
+    than or equal to $WT$
+
+Each copy has a version number.
+
+- `READ`: contact sites until a read quorum is formed, then read the copy with
+    the highest version number
+- `WRITE`: contact sites until a write quorum is formed. Get the version number
+    of the copy with the highest version number $k$, and then write to all 
+    sites in the quorum adding the new version number $k + 1$
+
+Recovery is free, but reading is no longer local and it isn't possible to 
+change the system dynamically as we need to know the copies in advance.
