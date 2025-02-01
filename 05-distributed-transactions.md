@@ -108,6 +108,31 @@ network messages sent by exploiting a particular linear network configuration.
 The total number of messages will be $2n$ instead of $3n$, but we also require
 more rounds, which is $2n$ instead of $3$.
 
+#### Cooperative Termination
+
+The termination doesn't refer here to the termination of a node / processor.
+It refers to the successful termination of the 2PC protocol when failures 
+occur in the system.
+
+Before that is covered, there are quite a few important considerations that we
+need to cover.
+
+A `COMMIT` decision is very fragile, and difficult to propagate through the 
+system. Uncertainty happens in the system when all participants have voted
+`YES`, and then the coordinator node has failed - they are all pending on the
+coordinator's response, in limbo basically. They have already agreed to 
+`COMMIT` the transaction, so they can't abort now. Gossping with other nodes
+doesn't help here.
+
+It is for this reason that the coordinator **must** log a commit record before
+sending out any messages. It must recall its decision after waking up from a 
+failure. Once this is sent out, there's no going back.
+
+An `ABORT` decision, in contrast, is very robust. So long as one node has voted
+`NO`, we know for certain that the protocol will result in a termination. So 
+even if the coordinator has failed, if one node has voted `NO`, we can safely
+terminate in an abortion of the transaction.
+
 ### 3PC protocol
 
 With the insight that 2PC may block if the coordinator fails after sending a
@@ -167,7 +192,6 @@ Persistence in 3PC happens very similarly to 2PC, in that it uses a WAL.
 - If some are aborted, abort. If some are committed, commit. If all uncertain,
     abort. If some committable but no committed received, send `PRE-COMMIT` to
     all and wait for ACKs to send a commit message.
-
 
 ## Replication
 
